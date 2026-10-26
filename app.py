@@ -1,513 +1,544 @@
-import os
-import sqlite3
-import uuid
-from datetime import date, datetime, timedelta
+from __future__ import annotations
 
+import os
+import re
+import uuid
+from datetime import date, datetime, timezone
+from typing import Any
+
+import httpx
 import pandas as pd
 import streamlit as st
 
 APP_NAME = "DentalFlow"
-DB_PATH = os.getenv("DENTALFLOW_DB_PATH", "dentalflow.db")
+BUCKET = "dental-files"
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+ALLOWED_EXTENSIONS = {".stl", ".pdf", ".png", ".jpg", ".jpeg", ".dcm", ".zip"}
+ALLOWED_MIME_TYPES = {
+    ".stl": {"model/stl", "application/sla", "application/octet-stream"},
+    ".pdf": {"application/pdf"},
+    ".png": {"image/png"},
+    ".jpg": {"image/jpeg"},
+    ".jpeg": {"image/jpeg"},
+    ".dcm": {"application/dicom", "application/octet-stream"},
+    ".zip": {"application/zip", "application/x-zip-compressed"},
+}
 
-st.set_page_config(
-    page_title="DentalFlow | Lab Work Orders",
-    page_icon="🦷",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="DentalFlow", page_icon="🦷", layout="wide")
 
-STATUSES = [
-    "Received",
-    "Accepted",
-    "In Production",
-    "Quality Check",
-    "Ready for Dispatch",
-    "Dispatched",
-    "Delivered",
-    "On Hold",
-    "Cancelled",
-]
-ACTIVE_STATUSES = ["Received", "Accepted", "In Production", "Quality Check", "Ready for Dispatch", "Dispatched", "On Hold"]
-CASE_TYPES = [
-    "Zirconia Crown",
-    "PFM Crown",
-    "E.max Crown",
-    "Bridge",
-    "Implant Crown",
-    "Denture",
-    "Veneer",
-    "Night Guard",
-    "Aligner / Retainer",
-    "Other",
-]
-PRIORITIES = ["Routine", "Priority", "Urgent"]
+st.markdown("""
+<style>
+:root { color-scheme: light; }
+.block-container {padding-top: 1.5rem; max-width: 1400px;}
+.df-brand {font-size: 1.9rem; font-weight: 800; letter-spacing: -.04em;}
+.df-muted {color: #64748b;}
+div[data-testid="stMetric"] {background: #f8fafc; border: 1px solid #e2e8f0; padding: 1rem; border-radius: 12px;}
+</style>
+""", unsafe_allow_html=True)
 
 
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, timeout=20, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+class DentalFlowError(RuntimeError):
+    pass
 
 
-def init_db():
-    with get_conn() as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS orders (
-                id TEXT PRIMARY KEY,
-                dentist_name TEXT NOT NULL,
-                clinic_name TEXT NOT NULL,
-                dentist_email TEXT NOT NULL,
-                patient_ref TEXT NOT NULL,
-                case_type TEXT NOT NULL,
-                tooth_numbers TEXT,
-                shade TEXT,
-                material TEXT,
-                units INTEGER NOT NULL DEFAULT 1,
-                priority TEXT NOT NULL DEFAULT 'Routine',
-                due_date TEXT NOT NULL,
-                instructions TEXT,
-                status TEXT NOT NULL DEFAULT 'Received',
-                lab_notes TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS order_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                order_id TEXT NOT NULL,
-                status TEXT NOT NULL,
-                note TEXT,
-                changed_by TEXT NOT NULL,
-                changed_at TEXT NOT NULL,
-                FOREIGN KEY(order_id) REFERENCES orders(id)
-            );
-            """
+def config_value(name: str) -> str:
+    try:
+        value = st.secrets.get(name, "")
+    except Exception:
+        value = ""
+    return str(value or os.environ.get(name, "")).strip()
+
+
+def config() -> tuple[str, str]:
+    url = config_value("SUPABASE_URL").rstrip("/")
+    key = config_value("SUPABASE_ANON_KEY")
+    if not url or not key:
+        raise DentalFlowError(
+            "Supabase is not configured. Add SUPABASE_URL and SUPABASE_ANON_KEY "
+            "to .streamlit/secrets.toml locally or to Streamlit Community Cloud app secrets."
         )
-        count = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
-        if count == 0:
-            now = datetime.now()
-            samples = [
-                ("DF-1048", "Dr. Maya Rao", "Indiranagar Dental Care", "maya@example.com", "PT-2031", "Zirconia Crown", "16", "A2", "Monolithic zirconia", 1, "Priority", (date.today() + timedelta(days=2)).isoformat(), "Match adjacent tooth; contact clinic if shade confirmation needed.", "In Production", "Framework completed; contouring in progress.", now - timedelta(days=3)),
-                ("DF-1047", "Dr. Arjun Mehta", "WhiteArc Dental Studio", "arjun@example.com", "PT-1984", "E.max Crown", "11", "A1", "Lithium disilicate", 1, "Routine", (date.today() + timedelta(days=4)).isoformat(), "High translucency, natural incisal edge.", "Accepted", "", now - timedelta(days=2)),
-                ("DF-1046", "Dr. Maya Rao", "Indiranagar Dental Care", "maya@example.com", "PT-2027", "Bridge", "24-26", "A3", "Zirconia", 3, "Urgent", (date.today() + timedelta(days=1)).isoformat(), "Please prioritize; verify pontic contour.", "Quality Check", "Final fit check underway.", now - timedelta(days=4)),
-                ("DF-1045", "Dr. Neha Iyer", "SmileCraft Clinic", "neha@example.com", "PT-1872", "Night Guard", "Full arch", "Clear", "Hard-soft splint", 1, "Routine", (date.today() - timedelta(days=1)).isoformat(), "Upper arch, light occlusal adjustment.", "Ready for Dispatch", "Packed and awaiting courier pickup.", now - timedelta(days=5)),
-                ("DF-1044", "Dr. Arjun Mehta", "WhiteArc Dental Studio", "arjun@example.com", "PT-1855", "Veneer", "21", "B1", "E.max", 1, "Routine", (date.today() - timedelta(days=2)).isoformat(), "Keep preparation margins conservative.", "Delivered", "Delivered to clinic reception.", now - timedelta(days=8)),
-            ]
-            for row in samples:
-                (oid, dentist, clinic, email, patient, case, teeth, shade, material, units,
-                 priority, due, instructions, status, notes, created) = row
-                created_s = created.isoformat(timespec="minutes")
-                updated_s = now.isoformat(timespec="minutes")
-                conn.execute(
-                    """INSERT INTO orders
-                    (id,dentist_name,clinic_name,dentist_email,patient_ref,case_type,tooth_numbers,
-                     shade,material,units,priority,due_date,instructions,status,lab_notes,created_at,updated_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (oid, dentist, clinic, email, patient, case, teeth, shade, material, units,
-                     priority, due, instructions, status, notes, created_s, updated_s),
-                )
-                conn.execute(
-                    "INSERT INTO order_history (order_id,status,note,changed_by,changed_at) VALUES (?,?,?,?,?)",
-                    (oid, "Received", "Order submitted to the lab.", dentist, created_s),
-                )
-                if status != "Received":
-                    conn.execute(
-                        "INSERT INTO order_history (order_id,status,note,changed_by,changed_at) VALUES (?,?,?,?,?)",
-                        (oid, status, notes or f"Status updated to {status}.", "Lab team", updated_s),
-                    )
+    if not url.startswith("https://"):
+        raise DentalFlowError("SUPABASE_URL must use HTTPS.")
+    return url, key
 
 
-def load_orders():
-    with get_conn() as conn:
-        return pd.read_sql_query("SELECT * FROM orders ORDER BY created_at DESC", conn)
+class SupabaseAPI:
+    """Small REST client that always sends the signed-in user's JWT for RLS checks."""
 
+    def __init__(self, url: str, anon_key: str, access_token: str | None = None):
+        self.url = url
+        self.anon_key = anon_key
+        self.access_token = access_token
 
-def load_history(order_id):
-    with get_conn() as conn:
-        return pd.read_sql_query(
-            "SELECT status,note,changed_by,changed_at FROM order_history WHERE order_id=? ORDER BY changed_at DESC, id DESC",
-            conn, params=(order_id,)
-        )
+    def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
+        headers = {"apikey": self.anon_key, "Content-Type": "application/json"}
+        if self.access_token:
+            headers["Authorization"] = f"Bearer {self.access_token}"
+        else:
+            headers["Authorization"] = f"Bearer {self.anon_key}"
+        if extra:
+            headers.update(extra)
+        return headers
 
-
-def create_order(data):
-    now = datetime.now().isoformat(timespec="minutes")
-    order_id = "DF-" + uuid.uuid4().hex[:6].upper()
-    with get_conn() as conn:
-        conn.execute(
-            """INSERT INTO orders
-            (id,dentist_name,clinic_name,dentist_email,patient_ref,case_type,tooth_numbers,
-             shade,material,units,priority,due_date,instructions,status,lab_notes,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                order_id, data["dentist_name"].strip(), data["clinic_name"].strip(),
-                data["dentist_email"].strip(), data["patient_ref"].strip(), data["case_type"],
-                data["tooth_numbers"].strip(), data["shade"].strip(), data["material"].strip(),
-                data["units"], data["priority"], data["due_date"].isoformat(),
-                data["instructions"].strip(), "Received", "", now, now,
-            ),
-        )
-        conn.execute(
-            "INSERT INTO order_history (order_id,status,note,changed_by,changed_at) VALUES (?,?,?,?,?)",
-            (order_id, "Received", "New order submitted.", data["dentist_name"].strip(), now),
-        )
-    return order_id
-
-
-def update_order(order_id, status, notes, changed_by="Lab team"):
-    now = datetime.now().isoformat(timespec="minutes")
-    with get_conn() as conn:
-        current = conn.execute("SELECT status FROM orders WHERE id=?", (order_id,)).fetchone()
-        if not current:
-            raise ValueError("Order not found.")
-        conn.execute(
-            "UPDATE orders SET status=?, lab_notes=?, updated_at=? WHERE id=?",
-            (status, notes.strip(), now, order_id),
-        )
-        if current["status"] != status or notes.strip():
-            note = notes.strip() or f"Status changed to {status}."
-            conn.execute(
-                "INSERT INTO order_history (order_id,status,note,changed_by,changed_at) VALUES (?,?,?,?,?)",
-                (order_id, status, note, changed_by, now),
+    def _request(self, method: str, path: str, *, auth: bool = False,
+                 params: dict | None = None, json_body: Any = None,
+                 content: bytes | None = None, headers: dict | None = None) -> Any:
+        url = f"{self.url}{path}"
+        try:
+            response = httpx.request(
+                method, url, headers=self._headers(headers), params=params,
+                json=json_body, content=content, timeout=30.0,
             )
+        except httpx.HTTPError as exc:
+            raise DentalFlowError("Could not connect to Supabase. Check the URL and network.") from exc
+        if response.status_code >= 400:
+            try:
+                body = response.json()
+                message = body.get("msg") or body.get("message") or body.get("error_description") or body.get("error") or "Request failed"
+            except Exception:
+                message = "Request failed"
+            # Avoid echoing tokens or arbitrary server response details.
+            raise DentalFlowError(f"Supabase request failed ({response.status_code}): {message}")
+        if response.status_code == 204 or not response.content:
+            return None
+        content_type = response.headers.get("content-type", "")
+        if "application/json" in content_type:
+            return response.json()
+        return response.content
+
+    def sign_in(self, email: str, password: str) -> dict:
+        return self._request("POST", "/auth/v1/token?grant_type=password",
+                             json_body={"email": email, "password": password})
+
+    def sign_up(self, email: str, password: str) -> dict:
+        return self._request("POST", "/auth/v1/signup",
+                             json_body={"email": email, "password": password})
+
+    def refresh(self, refresh_token: str) -> dict:
+        return self._request("POST", "/auth/v1/token?grant_type=refresh_token",
+                             json_body={"refresh_token": refresh_token})
+
+    def sign_out(self) -> None:
+        if self.access_token:
+            self._request("POST", "/auth/v1/logout")
+
+    def get(self, table: str, params: dict) -> list[dict]:
+        result = self._request("GET", f"/rest/v1/{table}", params=params)
+        return result if isinstance(result, list) else []
+
+    def post(self, table: str, payload: dict, *, prefer: str = "return=representation") -> list[dict]:
+        result = self._request("POST", f"/rest/v1/{table}", json_body=payload,
+                               headers={"Prefer": prefer})
+        return result if isinstance(result, list) else ([] if result is None else [result])
+
+    def patch(self, table: str, params: dict, payload: dict) -> list[dict]:
+        result = self._request("PATCH", f"/rest/v1/{table}", params=params,
+                               json_body=payload, headers={"Prefer": "return=representation"})
+        return result if isinstance(result, list) else ([] if result is None else [result])
+
+    def upload(self, path: str, file_bytes: bytes, content_type: str) -> None:
+        encoded_path = "/".join(httpx.QueryParams({"p": path})["p"].split("/"))
+        # Storage object paths are URL path components; encode each segment safely.
+        from urllib.parse import quote
+        encoded_path = "/".join(quote(part, safe="") for part in path.split("/"))
+        self._request(
+            "POST", f"/storage/v1/object/{BUCKET}/{encoded_path}",
+            content=file_bytes,
+            headers={"Content-Type": content_type, "x-upsert": "false"},
+        )
+
+    def download(self, path: str) -> bytes:
+        from urllib.parse import quote
+        encoded_path = "/".join(quote(part, safe="") for part in path.split("/"))
+        return self._request("GET", f"/storage/v1/object/{BUCKET}/{encoded_path}")
+
+    def signed_url(self, path: str, expires_in: int = 60) -> str:
+        from urllib.parse import quote
+        encoded_path = "/".join(quote(part, safe="") for part in path.split("/"))
+        data = self._request("POST", f"/storage/v1/object/sign/{BUCKET}/{encoded_path}",
+                             json_body={"expiresIn": expires_in})
+        signed = data.get("signedURL") or data.get("signedUrl") or ""
+        if signed.startswith("http"):
+            return signed
+        return f"{self.url}/storage/v1{signed}"
 
 
-def inject_css():
-    st.markdown(
-        """
-        <style>
-        @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap');
-        :root { --ink:#172B4D; --muted:#718096; --teal:#087E8B; --teal-dark:#06636D;
-                --line:#E5EBF2; --canvas:#F5F8FC; --white:#FFFFFF; }
-        html, body, [class*="css"] { font-family:'DM Sans',sans-serif; }
-        .stApp { background:var(--canvas); color:var(--ink); }
-        [data-testid="stHeader"] { background:rgba(245,248,252,.92); }
-        [data-testid="stSidebar"] { background:#FFFFFF; border-right:1px solid var(--line); }
-        [data-testid="stSidebar"] > div { padding-top:1.25rem; }
-        h1,h2,h3 { font-family:'Manrope',sans-serif !important; color:var(--ink); letter-spacing:-.035em; }
-        h1 { font-size:2rem !important; font-weight:800 !important; }
-        h2 { font-size:1.35rem !important; font-weight:750 !important; }
-        .brand { font-family:'Manrope',sans-serif; font-size:1.45rem; font-weight:800; color:var(--ink); }
-        .brand span { color:var(--teal); }
-        .eyebrow { text-transform:uppercase; letter-spacing:.13em; font-size:.69rem; font-weight:700; color:var(--teal); }
-        .page-subtitle { color:var(--muted); margin-top:-.55rem; margin-bottom:1.25rem; }
-        .metric-card { background:#fff; border:1px solid var(--line); border-radius:16px; padding:18px 19px; min-height:118px; box-shadow:0 3px 12px rgba(27,48,76,.025); }
-        .metric-label { color:#718096; font-size:.82rem; font-weight:600; }
-        .metric-value { color:var(--ink); font-family:'Manrope',sans-serif; font-size:1.9rem; font-weight:800; line-height:1.55; }
-        .metric-foot { font-size:.75rem; color:#7D8BA0; }
-        .section-card { background:#fff; border:1px solid var(--line); border-radius:16px; padding:20px; margin-bottom:14px; }
-        .case-id { color:var(--teal); font-weight:800; letter-spacing:.02em; }
-        .muted { color:var(--muted); font-size:.88rem; }
-        .pill { display:inline-block; border-radius:999px; padding:4px 10px; font-size:.72rem; font-weight:700; background:#E6F5F5; color:#087E8B; }
-        .stButton > button, .stFormSubmitButton > button { border-radius:10px; font-weight:700; min-height:2.65rem; border:1px solid #D9E3EE; }
-        .stButton > button[kind="primary"], .stFormSubmitButton > button[kind="primary"] { background:var(--teal); border-color:var(--teal); color:white; }
-        .stButton > button[kind="primary"]:hover, .stFormSubmitButton > button[kind="primary"]:hover { background:var(--teal-dark); border-color:var(--teal-dark); }
-        div[data-baseweb="input"] input, div[data-baseweb="select"] > div, textarea { border-radius:9px !important; }
-        div[data-testid="stDataFrame"] { border:1px solid var(--line); border-radius:12px; overflow:hidden; }
-        div[data-testid="stExpander"] { background:white; border:1px solid var(--line); border-radius:12px; }
-        hr { border-color:var(--line); }
-        .footer-note { color:#8A97A9; font-size:.76rem; text-align:center; padding:20px 0 8px; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+def set_session(tokens: dict) -> None:
+    st.session_state["access_token"] = tokens.get("access_token")
+    st.session_state["refresh_token"] = tokens.get("refresh_token")
+    st.session_state["token_expires_at"] = datetime.now(timezone.utc).timestamp() + int(tokens.get("expires_in", 3600)) - 60
+    st.session_state["user"] = tokens.get("user", {})
 
 
-def metric(label, value, foot):
-    st.markdown(
-        f"""<div class="metric-card"><div class="metric-label">{label}</div>
-        <div class="metric-value">{value}</div><div class="metric-foot">{foot}</div></div>""",
-        unsafe_allow_html=True,
-    )
+def get_api() -> SupabaseAPI:
+    url, key = config()
+    token = st.session_state.get("access_token")
+    expires = st.session_state.get("token_expires_at", 0)
+    if token and datetime.now(timezone.utc).timestamp() >= expires:
+        refresh = st.session_state.get("refresh_token")
+        if not refresh:
+            clear_session()
+            raise DentalFlowError("Your session expired. Please sign in again.")
+        tokens = SupabaseAPI(url, key).refresh(refresh)
+        set_session(tokens)
+        token = tokens.get("access_token")
+    return SupabaseAPI(url, key, token)
 
 
-def status_label(status):
-    icons = {
-        "Received": "📥", "Accepted": "✓", "In Production": "⚙️",
-        "Quality Check": "🔎", "Ready for Dispatch": "📦", "Dispatched": "🚚",
-        "Delivered": "✓", "On Hold": "⏸", "Cancelled": "✕",
-    }
-    return f'{icons.get(status, "•")} {status}'
+def clear_session() -> None:
+    for key in ("access_token", "refresh_token", "token_expires_at", "user", "membership"):
+        st.session_state.pop(key, None)
 
 
-def render_order_table(df):
-    if df.empty:
-        st.info("No orders match your filters.")
-        return
-    view = df.copy()
-    view["Order"] = view["id"]
-    view["Patient ref"] = view["patient_ref"]
-    view["Case"] = view["case_type"]
-    view["Due date"] = view["due_date"]
-    view["Status"] = view["status"]
-    view["Priority"] = view["priority"]
-    cols = ["Order", "Patient ref", "Case", "Due date", "Status", "Priority"]
-    st.dataframe(view[cols], use_container_width=True, hide_index=True)
+def render_auth() -> None:
+    st.markdown('<div class="df-brand">🦷 DentalFlow</div>', unsafe_allow_html=True)
+    st.caption("Secure dental lab work orders")
+    st.info("Accounts are provisioned by your lab administrator. Public self-registration is disabled to prevent unauthorized clinic access.")
+    tab_login, tab_reset = st.tabs(["Sign in", "Need access?"])
+    with tab_login:
+        with st.form("login_form"):
+            email = st.text_input("Work email", autocomplete="email")
+            password = st.text_input("Password", type="password", autocomplete="current-password")
+            submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
+        if submitted:
+            if not email.strip() or not password:
+                st.error("Enter your email and password.")
+            else:
+                try:
+                    url, key = config()
+                    tokens = SupabaseAPI(url, key).sign_in(email.strip(), password)
+                    if not tokens.get("access_token"):
+                        st.error("Sign-in did not return a session. Confirm your email if required, then try again.")
+                    else:
+                        set_session(tokens)
+                        st.rerun()
+                except DentalFlowError as exc:
+                    st.error(str(exc))
+    with tab_reset:
+        st.write("Contact your lab administrator to have an account created or your password reset.")
+        st.caption("Password reset flows can be enabled later with a verified redirect URL and email provider configuration.")
 
 
-def render_order_details(order):
-    with st.expander(f'{order["id"]} · {order["case_type"]} · {order["status"]}', expanded=False):
-        left, right = st.columns(2)
-        with left:
-            st.markdown(f'**Clinic:** {order["clinic_name"]}')
-            st.markdown(f'**Dentist:** {order["dentist_name"]}')
-            st.markdown(f'**Patient reference:** {order["patient_ref"]}')
-            st.markdown(f'**Teeth / area:** {order["tooth_numbers"] or "—"}')
-            st.markdown(f'**Shade:** {order["shade"] or "—"}')
-        with right:
-            st.markdown(f'**Material:** {order["material"] or "—"}')
-            st.markdown(f'**Units:** {order["units"]}')
-            st.markdown(f'**Priority:** {order["priority"]}')
-            st.markdown(f'**Due:** {order["due_date"]}')
-            st.markdown(f'**Submitted:** {order["created_at"]}')
-        if order["instructions"]:
-            st.markdown("**Dentist instructions**")
-            st.write(order["instructions"])
-        if order["lab_notes"]:
-            st.markdown("**Latest lab note**")
-            st.write(order["lab_notes"])
-        hist = load_history(order["id"])
-        st.markdown("**Order timeline**")
-        if hist.empty:
-            st.caption("No timeline events yet.")
-        else:
-            for _, event in hist.iterrows():
-                st.markdown(
-                    f'**{event["status"]}** · {event["changed_at"]}  \n'
-                    f'{event["note"] or ""}  \n'
-                    f'<span class="muted">Updated by {event["changed_by"]}</span>',
-                    unsafe_allow_html=True,
-                )
-                st.divider()
+def load_membership(api: SupabaseAPI) -> dict | None:
+    user = st.session_state.get("user", {})
+    uid = user.get("id")
+    if not uid:
+        return None
+    rows = api.get("memberships", {
+        "select": "id,lab_id,clinic_id,role,active,clinics(id,name,code),labs(id,name)",
+        "user_id": f"eq.{uid}",
+        "active": "eq.true",
+        "limit": "2",
+    })
+    if not rows:
+        return None
+    # The first release intentionally supports one active membership per login.
+    if len(rows) > 1:
+        raise DentalFlowError("This account has multiple active memberships. Ask the lab administrator to resolve the ambiguity.")
+    membership = rows[0]
+    st.session_state["membership"] = membership
+    return membership
 
 
-def dentist_portal(df):
-    st.markdown('<div class="eyebrow">DENTIST WORKSPACE</div>', unsafe_allow_html=True)
-    st.title("Your lab orders")
-    st.markdown('<div class="page-subtitle">Submit cases, follow progress, and keep every case in one place.</div>', unsafe_allow_html=True)
-
-    mine_name = st.session_state.get("dentist_name", "Dr. Maya Rao")
-    mine_clinic = st.session_state.get("clinic_name", "Indiranagar Dental Care")
-    mine_email = st.session_state.get("dentist_email", "maya@example.com")
-
-    active = df[~df["status"].isin(["Delivered", "Cancelled"])] if not df.empty else df
-    completed = df[df["status"] == "Delivered"] if not df.empty else df
-    c1, c2, c3 = st.columns(3)
-    with c1: metric("Active cases", len(active), "Cases still in progress")
-    with c2: metric("Ready for dispatch", int((df["status"] == "Ready for Dispatch").sum()) if not df.empty else 0, "Awaiting collection")
-    with c3: metric("Delivered cases", len(completed), "Completed and delivered")
-
-    tab_new, tab_orders, tab_history = st.tabs(["＋  New work order", "▤  My orders", "◷  Order history"])
-    with tab_new:
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.subheader("Create a lab order")
-        st.caption("Fields marked * are required. Use a patient reference instead of a full patient name in this demo.")
-        with st.form("new_order_form", clear_on_submit=True):
-            st.markdown("**Clinic details**")
-            a, b = st.columns(2)
-            with a:
-                dentist_name = st.text_input("Dentist name *", value=mine_name)
-                clinic_name = st.text_input("Clinic name *", value=mine_clinic)
-            with b:
-                dentist_email = st.text_input("Contact email *", value=mine_email)
-                patient_ref = st.text_input("Patient reference / case code *", placeholder="e.g. PT-2048")
-            st.divider()
-            st.markdown("**Case specifications**")
-            a, b, c = st.columns(3)
-            with a:
-                case_type = st.selectbox("Case type *", CASE_TYPES)
-                tooth_numbers = st.text_input("Tooth number(s) / area", placeholder="e.g. 11, 12 or upper arch")
-            with b:
-                shade = st.text_input("Shade", placeholder="e.g. A2")
-                material = st.text_input("Material", placeholder="e.g. Monolithic zirconia")
-            with c:
-                units = st.number_input("Number of units", min_value=1, max_value=32, value=1)
-                priority = st.selectbox("Priority", PRIORITIES)
-            a, b = st.columns(2)
-            with a:
-                due_date = st.date_input("Requested due date *", value=date.today() + timedelta(days=5), min_value=date.today())
-            with b:
-                instructions = st.text_area("Lab instructions", placeholder="Occlusion, contacts, margin notes, special requests…", height=100)
-            submitted = st.form_submit_button("Submit work order", type="primary", use_container_width=True)
-            if submitted:
-                if not dentist_name.strip() or not clinic_name.strip() or not dentist_email.strip() or not patient_ref.strip():
-                    st.error("Please complete all required fields.")
-                elif "@" not in dentist_email:
-                    st.error("Please enter a valid contact email.")
-                else:
-                    new_id = create_order({
-                        "dentist_name": dentist_name, "clinic_name": clinic_name,
-                        "dentist_email": dentist_email, "patient_ref": patient_ref,
-                        "case_type": case_type, "tooth_numbers": tooth_numbers,
-                        "shade": shade, "material": material, "units": int(units),
-                        "priority": priority, "due_date": due_date, "instructions": instructions,
-                    })
-                    st.session_state["dentist_name"] = dentist_name
-                    st.session_state["clinic_name"] = clinic_name
-                    st.session_state["dentist_email"] = dentist_email
-                    st.success(f"Order {new_id} submitted successfully.")
-                    st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    # Prototype filter: the demo profile can switch identity in the sidebar.
-    current_email = st.session_state.get("dentist_email", "maya@example.com").strip().lower()
-    my_df = df[df["dentist_email"].str.lower() == current_email] if not df.empty else df
-    with tab_orders:
-        a, b = st.columns([2, 1])
-        with a:
-            q = st.text_input("Search my orders", placeholder="Order ID, patient ref, case type…", key="dentist_search")
-        with b:
-            status_filter = st.selectbox("Status", ["All statuses"] + STATUSES, key="dentist_status")
-        filtered = my_df.copy()
-        if q:
-            mask = filtered.astype(str).apply(lambda col: col.str.contains(q, case=False, na=False)).any(axis=1)
-            filtered = filtered[mask]
-        if status_filter != "All statuses":
-            filtered = filtered[filtered["status"] == status_filter]
-        render_order_table(filtered)
-        for _, order in filtered.iterrows():
-            render_order_details(order)
-    with tab_history:
-        history_df = my_df[my_df["status"].isin(["Delivered", "Cancelled"])] if not my_df.empty else my_df
-        st.caption("Delivered and cancelled cases are retained here for reference.")
-        render_order_table(history_df)
-        for _, order in history_df.iterrows():
-            render_order_details(order)
+def require_membership(api: SupabaseAPI) -> dict | None:
+    cached = st.session_state.get("membership")
+    if cached:
+        return cached
+    return load_membership(api)
 
 
-def lab_dashboard(df):
-    st.markdown('<div class="eyebrow">LAB OPERATIONS</div>', unsafe_allow_html=True)
-    st.title("Lab dashboard")
-    st.markdown('<div class="page-subtitle">A live view of incoming cases, production progress, and dispatch readiness.</div>', unsafe_allow_html=True)
-
-    if df.empty:
-        st.info("No orders yet. Orders submitted in the dentist portal will appear here.")
-        return
-
-    today = date.today().isoformat()
-    open_df = df[~df["status"].isin(["Delivered", "Cancelled"])]
-    overdue = open_df[open_df["due_date"] < today]
-    received = df[df["status"] == "Received"]
-    production = df[df["status"] == "In Production"]
-    ready = df[df["status"] == "Ready for Dispatch"]
-
-    cols = st.columns(4)
-    with cols[0]: metric("Open cases", len(open_df), "Not yet delivered")
-    with cols[1]: metric("New received", len(received), "Awaiting lab acceptance")
-    with cols[2]: metric("In production", len(production), "Currently being fabricated")
-    with cols[3]: metric("Overdue", len(overdue), "Open cases past due date")
-
-    tab_queue, tab_manage, tab_all = st.tabs(["▤  Work queue", "⚙  Update a case", "▦  All orders"])
-    with tab_queue:
-        a, b, c = st.columns([1.3, 1, 1])
-        with a:
-            status_filter = st.selectbox("Status", ["All active"] + ACTIVE_STATUSES, key="lab_queue_status")
-        with b:
-            priority_filter = st.selectbox("Priority", ["All priorities"] + PRIORITIES, key="lab_queue_priority")
-        with c:
-            sort_by = st.selectbox("Sort by", ["Due date", "Newest first", "Priority"], key="lab_queue_sort")
-        queue = open_df.copy()
-        if status_filter != "All active":
-            queue = queue[queue["status"] == status_filter]
-        if priority_filter != "All priorities":
-            queue = queue[queue["priority"] == priority_filter]
-        if sort_by == "Due date":
-            queue = queue.sort_values("due_date")
-        elif sort_by == "Newest first":
-            queue = queue.sort_values("created_at", ascending=False)
-        else:
-            queue["_rank"] = queue["priority"].map({"Urgent": 0, "Priority": 1, "Routine": 2})
-            queue = queue.sort_values(["_rank", "due_date"])
-        render_order_table(queue)
-        for _, order in queue.iterrows():
-            render_order_details(order)
-
-    with tab_manage:
-        ids = df["id"].tolist()
-        chosen = st.selectbox("Select order", ids, format_func=lambda x: f'{x} · {df.loc[df["id"] == x, "case_type"].iloc[0]} · {df.loc[df["id"] == x, "patient_ref"].iloc[0]}')
-        order = df[df["id"] == chosen].iloc[0]
-        with st.container(border=True):
-            a, b = st.columns(2)
-            with a:
-                st.markdown(f"### {order['id']}")
-                st.write(f"**Clinic:** {order['clinic_name']}")
-                st.write(f"**Case:** {order['case_type']} · {order['units']} unit(s)")
-                st.write(f"**Patient reference:** {order['patient_ref']}")
-            with b:
-                st.write(f"**Current status:** {status_label(order['status'])}")
-                st.write(f"**Due date:** {order['due_date']}")
-                st.write(f"**Priority:** {order['priority']}")
-                st.write(f"**Dentist:** {order['dentist_name']}")
-            st.write("**Dentist instructions**")
-            st.write(order["instructions"] or "No special instructions provided.")
-        with st.form("update_order_form"):
-            next_status = st.selectbox("Update status", STATUSES, index=STATUSES.index(order["status"]))
-            notes = st.text_area("Lab update / note", value=order["lab_notes"] or "", placeholder="Record progress, QC result, dispatch reference, or reason for hold…")
-            confirm = st.form_submit_button("Save update", type="primary", use_container_width=True)
-            if confirm:
-                update_order(chosen, next_status, notes)
-                st.success(f"{chosen} updated.")
-                st.rerun()
-        st.markdown("**Status history**")
-        hist = load_history(chosen)
-        for _, event in hist.iterrows():
-            st.markdown(f'**{event["status"]}** · {event["changed_at"]}  \n{event["note"] or ""}  \n<span class="muted">By {event["changed_by"]}</span>', unsafe_allow_html=True)
-            st.divider()
-
-    with tab_all:
-        q = st.text_input("Search all orders", placeholder="Order ID, clinic, dentist, patient reference…", key="lab_all_search")
-        all_filtered = df.copy()
-        if q:
-            mask = all_filtered.astype(str).apply(lambda col: col.str.contains(q, case=False, na=False)).any(axis=1)
-            all_filtered = all_filtered[mask]
-        render_order_table(all_filtered)
-        csv = all_filtered.to_csv(index=False).encode("utf-8")
-        st.download_button("Download filtered orders as CSV", data=csv, file_name="dentalflow_orders.csv", mime="text/csv")
+def safe_text(value: Any) -> str:
+    return str(value or "").strip()
 
 
-def main():
-    init_db()
-    inject_css()
-    df = load_orders()
-
+def app_header(membership: dict) -> None:
+    user = st.session_state.get("user", {})
     with st.sidebar:
-        st.markdown('<div class="brand">🦷 Dental<span>Flow</span></div>', unsafe_allow_html=True)
-        st.caption("Dental lab work, in sync.")
+        st.markdown("## 🦷 DentalFlow")
+        st.caption(safe_text(user.get("email")))
+        st.markdown(f"**Role:** `{membership.get('role', 'unknown')}`")
+        st.caption("Lab: " + safe_text((membership.get("labs") or {}).get("name", "Dental lab")))
         st.divider()
-        role = st.radio("WORKSPACE", ["Dentist portal", "Lab dashboard"], label_visibility="visible")
-        st.divider()
-        st.markdown("**Demo profile**")
-        if role == "Dentist portal":
-            profile = st.selectbox(
-                "View as dentist",
-                ["Dr. Maya Rao", "Dr. Arjun Mehta", "Dr. Neha Iyer"],
-                label_visibility="collapsed",
-            )
-            profiles = {
-                "Dr. Maya Rao": ("Indiranagar Dental Care", "maya@example.com"),
-                "Dr. Arjun Mehta": ("WhiteArc Dental Studio", "arjun@example.com"),
-                "Dr. Neha Iyer": ("SmileCraft Clinic", "neha@example.com"),
-            }
-            clinic, email = profiles[profile]
-            st.session_state["dentist_name"] = profile
-            st.session_state["clinic_name"] = clinic
-            st.session_state["dentist_email"] = email
-        else:
-            st.markdown("**DentalFlow Lab Team**")
-            st.caption("Demo mode · no authentication")
-        st.divider()
-        st.caption("Prototype v0.1")
-        st.caption("Use synthetic patient references only.")
+        if st.button("Sign out", use_container_width=True):
+            try:
+                get_api().sign_out()
+            except Exception:
+                pass
+            clear_session()
+            st.rerun()
 
-    df = load_orders()
-    if role == "Dentist portal":
-        dentist_portal(df)
+
+def fetch_orders(api: SupabaseAPI, membership: dict) -> list[dict]:
+    return api.get("orders", {
+        "select": "id,order_number,patient_reference,work_type,shade,due_date,status,priority,notes,created_at,clinic_id,clinics(name,code)",
+        "order": "created_at.desc",
+        "limit": "500",
+    })
+
+
+def create_order(api: SupabaseAPI, membership: dict, clinic_id: str, patient_reference: str,
+                 work_type: str, shade: str, due_date: date, priority: str, notes: str) -> dict:
+    payload = {
+        "lab_id": membership["lab_id"],
+        "clinic_id": clinic_id,
+        "patient_reference": patient_reference.strip(),
+        "work_type": work_type,
+        "shade": shade.strip() or None,
+        "due_date": due_date.isoformat(),
+        "priority": priority,
+        "notes": notes.strip() or None,
+        "status": "submitted",
+        "created_by": st.session_state["user"]["id"],
+    }
+    rows = api.post("orders", payload)
+    if not rows:
+        raise DentalFlowError("Order was not created. Check that your membership has permission.")
+    return rows[0]
+
+
+def main_app() -> None:
+    try:
+        api = get_api()
+        membership = require_membership(api)
+        if not membership:
+            st.markdown('<div class="df-brand">🦷 DentalFlow</div>', unsafe_allow_html=True)
+            st.error("Your account is authenticated but has no active lab membership. Ask the lab administrator to provision your access.")
+            st.caption("No work-order data is shown until access is provisioned.")
+            if st.button("Sign out"):
+                clear_session()
+                st.rerun()
+            return
+
+        app_header(membership)
+        role = membership.get("role")
+        clinic = membership.get("clinics") or {}
+        lab = membership.get("labs") or {}
+        is_lab_staff = role in {"lab_admin", "lab_tech"}
+        is_admin = role == "lab_admin"
+
+        st.markdown('<div class="df-brand">DentalFlow</div>', unsafe_allow_html=True)
+        st.caption(f"{lab.get('name', 'Dental lab')} · Work orders")
+        tabs = st.tabs(["Dashboard", "Orders", "New order", "Clinics" if is_lab_staff else "Account"])
+        try:
+            orders = fetch_orders(api, membership)
+        except DentalFlowError as exc:
+            st.error(f"Could not load orders: {exc}")
+            orders = []
+
+        with tabs[0]:
+            all_count = len(orders)
+            in_progress = sum(o.get("status") in {"accepted", "in_production", "quality_check"} for o in orders)
+            due_soon = sum(o.get("due_date") == date.today().isoformat() and o.get("status") not in {"ready", "shipped", "delivered", "cancelled"} for o in orders)
+            complete = sum(o.get("status") in {"ready", "shipped", "delivered"} for o in orders)
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Visible orders", all_count)
+            c2.metric("In progress", in_progress)
+            c3.metric("Due today", due_soon)
+            c4.metric("Ready / shipped", complete)
+            st.subheader("Recent work")
+            if orders:
+                st.dataframe(pd.DataFrame([{
+                    "Order": o.get("order_number"),
+                    "Clinic": (o.get("clinics") or {}).get("name", "—"),
+                    "Patient reference": o.get("patient_reference"),
+                    "Work": o.get("work_type"),
+                    "Due": o.get("due_date"),
+                    "Status": o.get("status"),
+                    "Priority": o.get("priority"),
+                } for o in orders[:10]]), use_container_width=True, hide_index=True)
+            else:
+                st.info("No orders yet. Create the first order or ask a clinic to submit one.")
+
+        with tabs[1]:
+            st.subheader("Work orders")
+            search = st.text_input("Search order number, patient reference, or clinic", key="order_search")
+            statuses = ["all", "submitted", "accepted", "in_production", "quality_check", "ready", "shipped", "delivered", "cancelled"]
+            chosen_status = st.selectbox("Filter by status", statuses)
+            filtered = orders
+            if chosen_status != "all":
+                filtered = [o for o in filtered if o.get("status") == chosen_status]
+            if search.strip():
+                term = search.lower().strip()
+                filtered = [o for o in filtered if term in " ".join([
+                    safe_text(o.get("order_number")), safe_text(o.get("patient_reference")),
+                    safe_text((o.get("clinics") or {}).get("name"))
+                ]).lower()]
+            if filtered:
+                st.dataframe(pd.DataFrame([{
+                    "Order": o.get("order_number"), "Clinic": (o.get("clinics") or {}).get("name", "—"),
+                    "Patient reference": o.get("patient_reference"), "Work": o.get("work_type"),
+                    "Shade": o.get("shade") or "—", "Due": o.get("due_date"),
+                    "Status": o.get("status"), "Priority": o.get("priority"),
+                } for o in filtered]), use_container_width=True, hide_index=True)
+                st.download_button("Export visible orders (CSV)", pd.DataFrame(filtered).drop(
+                    columns=["clinics"], errors="ignore").to_csv(index=False).encode("utf-8"),
+                    file_name="dentalflow-orders.csv", mime="text/csv")
+                st.divider()
+                st.subheader("Order details and status")
+                selected = st.selectbox("Select order", filtered, format_func=lambda o: f"{o.get('order_number')} · {o.get('patient_reference')}")
+                st.write(f"**Clinic:** {(selected.get('clinics') or {}).get('name', '—')}")
+                st.write(f"**Notes:** {selected.get('notes') or 'No notes'}")
+                if is_lab_staff:
+                    allowed_statuses = ["submitted", "accepted", "in_production", "quality_check", "ready", "shipped", "delivered", "cancelled"]
+                    with st.form("status_update"):
+                        new_status = st.selectbox("Update status", allowed_statuses,
+                                                  index=allowed_statuses.index(selected.get("status", "submitted")) if selected.get("status") in allowed_statuses else 0)
+                        update_note = st.text_input("Status note (optional)")
+                        update = st.form_submit_button("Save status", type="primary")
+                    if update and new_status != selected.get("status"):
+                        try:
+                            updated = api.patch("orders", {"id": f"eq.{selected['id']}"}, {
+                                "status": new_status,
+                                "status_note": update_note.strip() or None,
+                                "updated_by": st.session_state["user"]["id"],
+                            })
+                            if updated:
+                                st.success("Status updated.")
+                                st.rerun()
+                            st.error("No order was updated. Check your role and RLS policies.")
+                        except DentalFlowError as exc:
+                            st.error(str(exc))
+                else:
+                    st.caption("Your lab team will update the order status.")
+                # File list and upload: clinic members may upload to their own clinic's order;
+                # lab staff may upload to any order visible under RLS.
+                st.divider()
+                st.subheader("Dental files")
+                try:
+                    file_rows = api.get("order_files", {
+                        "select": "id,file_name,object_path,content_type,size_bytes,created_at",
+                        "order_id": f"eq.{selected['id']}", "order": "created_at.desc"
+                    })
+                except DentalFlowError:
+                    file_rows = []
+                if file_rows:
+                    for f in file_rows:
+                        left, right = st.columns([4, 1])
+                        left.write(f"{f.get('file_name')} · {round((f.get('size_bytes') or 0)/1024/1024, 2)} MB")
+                        try:
+                            signed = api.signed_url(f["object_path"], 60)
+                            right.link_button("Open (60s)", signed)
+                        except DentalFlowError:
+                            right.caption("No access")
+                else:
+                    st.caption("No files attached to this order.")
+                uploaded = st.file_uploader("Attach STL, PDF, image, DICOM, or ZIP (max 25 MB)",
+                                            type=[x.lstrip(".") for x in sorted(ALLOWED_EXTENSIONS)],
+                                            key=f"upload-{selected['id']}")
+                if uploaded and st.button("Upload file", key=f"upload-button-{selected['id']}"):
+                    suffix = "." + uploaded.name.rsplit(".", 1)[-1].lower() if "." in uploaded.name else ""
+                    data = uploaded.getvalue()
+                    mime = uploaded.type or "application/octet-stream"
+                    if suffix not in ALLOWED_EXTENSIONS:
+                        st.error("This file type is not allowed.")
+                    elif len(data) > MAX_UPLOAD_BYTES:
+                        st.error("File exceeds the 25 MB limit.")
+                    elif mime not in ALLOWED_MIME_TYPES.get(suffix, set()):
+                        st.error("The file's reported content type does not match the allowed type.")
+                    else:
+                        path = f"{membership['lab_id']}/{selected['clinic_id']}/{selected['id']}/{uuid.uuid4().hex}{suffix}"
+                        try:
+                            api.upload(path, data, mime)
+                            api.post("order_files", {
+                                "lab_id": membership["lab_id"], "clinic_id": selected["clinic_id"],
+                                "order_id": selected["id"], "uploaded_by": st.session_state["user"]["id"],
+                                "file_name": uploaded.name, "object_path": path,
+                                "content_type": mime, "size_bytes": len(data),
+                            })
+                            st.success("File uploaded.")
+                            st.rerun()
+                        except DentalFlowError as exc:
+                            st.error(f"Upload failed: {exc}")
+            else:
+                st.info("No orders match these filters.")
+
+        with tabs[2]:
+            st.subheader("Create work order")
+            if role not in {"lab_admin", "lab_tech", "dentist"}:
+                st.warning("Your role cannot create orders.")
+            else:
+                clinics = api.get("clinics", {"select": "id,name,code", "active": "eq.true", "order": "name.asc"})
+                if role == "dentist":
+                    clinics = [c for c in clinics if c.get("id") == membership.get("clinic_id")]
+                if not clinics:
+                    st.info("No active clinics are available to this account.")
+                else:
+                    with st.form("create_order"):
+                        clinic_option = st.selectbox("Clinic", clinics, format_func=lambda c: f"{c['name']} ({c.get('code') or 'no code'})", disabled=(role == "dentist"))
+                        patient_ref = st.text_input("Patient reference / case ID", help="Use a clinic's internal case reference; avoid unnecessary patient-identifying information.")
+                        work_type = st.selectbox("Work type", ["Crown", "Bridge", "Implant", "Denture", "Veneer", "Aligner / retainer", "Night guard", "Other"])
+                        shade = st.text_input("Shade", placeholder="e.g. A2")
+                        due = st.date_input("Due date", min_value=date.today())
+                        priority = st.selectbox("Priority", ["standard", "rush"])
+                        notes = st.text_area("Instructions")
+                        create = st.form_submit_button("Create order", type="primary")
+                    if create:
+                        if not patient_ref.strip():
+                            st.error("Enter a patient reference or case ID.")
+                        else:
+                            try:
+                                created = create_order(api, membership, clinic_option["id"], patient_ref, work_type, shade, due, priority, notes)
+                                st.success(f"Order {created.get('order_number', created.get('id'))} created.")
+                                st.rerun()
+                            except DentalFlowError as exc:
+                                st.error(str(exc))
+
+        with tabs[3]:
+            if is_lab_staff:
+                st.subheader("Clinics")
+                clinics = api.get("clinics", {"select": "id,name,code,contact_email,phone,active,created_at", "order": "name.asc"})
+                if clinics:
+                    st.dataframe(pd.DataFrame(clinics), use_container_width=True, hide_index=True)
+                else:
+                    st.info("No clinics configured yet.")
+                if is_admin:
+                    st.divider()
+                    st.subheader("Add a clinic")
+                    with st.form("add_clinic"):
+                        name = st.text_input("Clinic name")
+                        code = st.text_input("Clinic code (short, unique)")
+                        contact = st.text_input("Contact email")
+                        phone = st.text_input("Phone")
+                        add = st.form_submit_button("Add clinic")
+                    if add:
+                        if not name.strip() or not code.strip():
+                            st.error("Clinic name and code are required.")
+                        else:
+                            try:
+                                api.post("clinics", {
+                                    "lab_id": membership["lab_id"], "name": name.strip(),
+                                    "code": code.strip().upper(), "contact_email": contact.strip() or None,
+                                    "phone": phone.strip() or None,
+                                })
+                                st.success("Clinic created. Add user memberships through the provisioning instructions in README.")
+                                st.rerun()
+                            except DentalFlowError as exc:
+                                st.error(str(exc))
+            else:
+                st.subheader("Account")
+                st.write("**Email:**", st.session_state.get("user", {}).get("email", "—"))
+                st.write("**Clinic:**", clinic.get("name", "—"))
+                st.write("**Role:**", role)
+
+    except DentalFlowError as exc:
+        st.error(str(exc))
+        st.caption("If the problem persists, check the Supabase project URL, anon key, migration status, and RLS policies.")
+
+
+def main() -> None:
+    try:
+        config()
+    except DentalFlowError as exc:
+        st.markdown('<div class="df-brand">🦷 DentalFlow</div>', unsafe_allow_html=True)
+        st.error(str(exc))
+        st.code('SUPABASE_URL = "https://YOUR_PROJECT.supabase.co"\nSUPABASE_ANON_KEY = "YOUR_SUPABASE_PUBLISHABLE_OR_ANON_KEY"')
+        st.stop()
+    if not st.session_state.get("access_token"):
+        render_auth()
     else:
-        lab_dashboard(df)
-
-    st.markdown('<div class="footer-note">DentalFlow · Lab collaboration made clearer · Prototype only</div>', unsafe_allow_html=True)
+        main_app()
 
 
 if __name__ == "__main__":
     main()
+
